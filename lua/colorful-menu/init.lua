@@ -192,6 +192,10 @@ end
 function M.blink_components_text(ctx)
     local highlights_info = M.blink_highlights(ctx)
     if highlights_info ~= nil then
+        -- If using combined approach (not separate columns), append detail
+        if highlights_info.detail_text ~= nil then
+            return highlights_info.label .. " " .. highlights_info.detail_text
+        end
         return highlights_info.label
     else
         ---@diagnostic disable-next-line: undefined-field
@@ -206,12 +210,74 @@ function M.blink_components_highlight(ctx)
     local highlights_info = M.blink_highlights(ctx)
     if highlights_info ~= nil then
         highlights = highlights_info.highlights
+        -- If using combined approach, append detail highlights
+        if highlights_info.detail_text ~= nil and highlights_info.detail_highlights ~= nil then
+            local label_len = #highlights_info.label
+            for _, h in ipairs(highlights_info.detail_highlights) do
+                table.insert(highlights, {
+                    h[1] + label_len + 1,  -- +1 for the space
+                    h[2] + label_len + 1,
+                    group = h.group
+                })
+            end
+        end
     end
     ---@diagnostic disable-next-line: undefined-field
     for _, idx in ipairs(ctx.label_matched_indices) do
         table.insert(highlights, { idx, idx + 1, group = "BlinkCmpLabelMatch" })
     end
     return highlights
+end
+
+---@diagnostic disable-next-line: undefined-doc-name
+---@param ctx blink.cmp.DrawItemContext
+-- Returns label highlights without the detail portion (for use with separate detail column)
+function M.blink_components_label_highlight(ctx)
+    local highlights = {}
+    local highlights_info = M.blink_highlights(ctx)
+    if highlights_info ~= nil then
+        highlights = highlights_info.highlights
+    end
+    ---@diagnostic disable-next-line: undefined-field
+    for _, idx in ipairs(ctx.label_matched_indices) do
+        table.insert(highlights, { idx, idx + 1, group = "BlinkCmpLabelMatch" })
+    end
+    return highlights
+end
+
+---@diagnostic disable-next-line: undefined-doc-name
+---@param ctx blink.cmp.DrawItemContext
+-- Returns just the label text without detail (for use with separate detail column)
+function M.blink_components_label_text(ctx)
+    local highlights_info = M.blink_highlights(ctx)
+    if highlights_info ~= nil then
+        return highlights_info.label
+    else
+        ---@diagnostic disable-next-line: undefined-field
+        return ctx.label
+    end
+end
+
+---@diagnostic disable-next-line: undefined-doc-name
+---@param ctx blink.cmp.DrawItemContext
+function M.blink_components_detail_text(ctx)
+    local highlights_info = M.blink_highlights(ctx)
+    if highlights_info ~= nil and highlights_info.detail_text ~= nil then
+        return highlights_info.detail_text
+    else
+        return ""
+    end
+end
+
+---@diagnostic disable-next-line: undefined-doc-name
+---@param ctx blink.cmp.DrawItemContext
+function M.blink_components_detail_highlight(ctx)
+    local highlights_info = M.blink_highlights(ctx)
+    if highlights_info ~= nil and highlights_info.detail_highlights ~= nil then
+        return highlights_info.detail_highlights
+    else
+        return {}
+    end
 end
 
 ---@diagnostic disable-next-line: undefined-doc-name
@@ -230,12 +296,33 @@ function M.blink_highlights(ctx)
                     info.range[2],
                     ---@diagnostic disable-next-line: undefined-field
                     group = ctx.deprecated and "BlinkCmpLabelDeprecated" or info[1],
+                    priority = info.priority,
                 })
             end
+
+            -- Process detail highlights if present
+            local detail_highlights = {}
+            if highlights_info.detail_highlights then
+                for _, info in ipairs(highlights_info.detail_highlights) do
+                    table.insert(detail_highlights, {
+                        info.range[1],
+                        info.range[2],
+                        ---@diagnostic disable-next-line: undefined-field
+                        group = ctx.deprecated and "BlinkCmpLabelDeprecated" or info[1],
+                        priority = info.priority,
+                    })
+                end
+            end
+
+            return {
+                label = highlights_info.text,
+                highlights = highlights,
+                detail_text = highlights_info.detail_text,
+                detail_highlights = detail_highlights,
+            }
         else
             return nil
         end
-        return { label = highlights_info.text, highlights = highlights }
     end
     return nil
 end

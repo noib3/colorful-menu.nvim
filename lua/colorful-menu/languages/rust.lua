@@ -37,15 +37,11 @@ local function _rust_analyzer(completion_item, ls)
         return utils.highlight_range(completion_item.label, ls, 0, #completion_item.label)
     end
 
-    if kind == Kind.Field and detail then
+    if kind == Kind.Field then
+        -- Just highlight the field name, no type info
         local name = completion_item.label
-        local text = string.format("%s:%s%s", name, align_spaces(name .. " ", detail), detail)
-        local source = string.format("struct S { %s }", text)
-        local hl = utils.highlight_range(source, ls, 11, 11 + #text)
-        if config.ls["rust-analyzer"].align_type_to_right == false then
-            return hl
-        end
-        hl.text = hl.text:sub(1, #name) .. " " .. hl.text:sub(#name + 2, #text)
+        local source = string.format("struct S { %s: () }", name)
+        local hl = utils.highlight_range(source, ls, 11, 11 + #name)
         return hl
         --
     elseif
@@ -58,116 +54,92 @@ local function _rust_analyzer(completion_item, ls)
         return utils.highlight_range(source, ls, 10, 10 + #label)
     elseif
         (kind == Kind.Constant or kind == Kind.Variable)
-        and detail
         and completion_item.insertTextFormat ~= insertTextFormat.Snippet
     then
+        -- Just highlight the variable/constant name, no type info
         local name = completion_item.label
-        local text = string.format(
-            "%s:%s%s",
-            name,
-            align_spaces(name .. " ", completion_item.detail),
-            completion_item.detail or detail
-        )
-        local source = string.format("let %s = ();", text)
-        local hl = utils.highlight_range(source, ls, 4, 4 + #text)
-        if config.ls["rust-analyzer"].align_type_to_right == false then
-            return hl
+        local source = string.format("let %s = ();", name)
+        local hl = utils.highlight_range(source, ls, 4, 4 + #name)
+        if kind == Kind.Constant then
+            -- Override highlight to use @constant
+            for _, h in ipairs(hl.highlights) do
+                if h[1]:find("variable") then
+                    h[1] = utils.hl_exist_or("@constant", "@variable", "rust")
+                end
+            end
         end
-        hl.text = hl.text:sub(1, #name) .. " " .. hl.text:sub(#name + 2, #text)
         return hl
         --
-    elseif (kind == Kind.EnumMember) and detail then
-        local source = string.format("enum S { %s }", detail)
-        return utils.highlight_range(source, ls, 9, 9 + #detail)
+    elseif kind == Kind.EnumMember then
+        -- Just highlight the enum member name, no variant details
+        local name = completion_item.label
+        local source = string.format("enum S { %s }", name)
+        return utils.highlight_range(source, ls, 9, 9 + #name)
         --
     elseif (kind == Kind.Function or kind == Kind.Method) and detail then
-        local pattern = "%((.-)%)"
+        -- Just highlight the label, optionally add ellipsis for args
+        local current_label = label
 
-        local ignored = nil
-        if label:match("^iter%(%)%..+") ~= nil then
-            ignored = "iter()."
-            label = completion_item.label:sub(string.len(ignored) + 1)
+        -- Ensure label has parentheses
+        if not current_label:match("%(") then
+            current_label = current_label .. "()"
         end
-        if label:match("^self%..+") ~= nil then
-            ignored = "self."
-            label = completion_item.label:sub(string.len(ignored) + 1)
-        end
-        local function adjust(hl)
-            if ignored == "self." then
-                utils.adjust_range(hl, string.len(ignored) + 1, ignored)
-            elseif ignored == "iter()." then
-                utils.adjust_range(hl, string.len(ignored) + 1, ignored, nil, iter_chain())
+
+        -- Create simple function syntax for treesitter highlighting
+        local source = string.format("fn %s {}", current_label)
+        local hl = utils.highlight_range(source, ls, 3, 3 + #current_label)
+
+        -- Check if function needs non-self arguments
+        local needs_args = false
+        if function_signature then
+            local params_match = function_signature:match("%((.-)%)")
+            if params_match then
+                -- Remove self variations and check if anything remains
+                local non_self = params_match:gsub("&?%s*mut%s+self%s*,?%s*", "")
+                                             :gsub("&?%s*self%s*,?%s*", "")
+                                             :gsub("^%s*", ""):gsub("%s*$", "")
+                if non_self ~= "" then
+                    needs_args = true
+                end
             end
         end
 
-        local result = string.match(label, pattern)
-        if not result then
-            label = label .. "()"
+        -- Insert ellipsis if args are needed and parens are empty
+        if needs_args and current_label:match("%(%)") then
+            local open_paren_pos = hl.text:find("%(")
+            if open_paren_pos then
+                -- Insert … (3 bytes in UTF-8)
+                hl.text = hl.text:sub(1, open_paren_pos) .. "…" .. hl.text:sub(open_paren_pos + 1)
+                -- Shift highlights that come after insertion
+                for _, h in ipairs(hl.highlights) do
+                    if h.range[1] >= open_paren_pos then
+                        h.range = { h.range[1] + 3, h.range[2] + 3 }
+                    elseif h.range[2] > open_paren_pos then
+                        h.range = { h.range[1], h.range[2] + 3 }
+                    end
+                end
+                -- Highlight the ellipsis
+                table.insert(hl.highlights, { "@comment", range = { open_paren_pos, open_paren_pos + 3 } })
+            end
         end
-        local regex_pattern = "%b()"
-        local prefix, suffix = string.match(function_signature or "", "^(.*fn)(.*)$")
-        if prefix ~= nil and suffix ~= nil then
-            local start_pos = string.find(suffix, "(", nil, true)
-            if start_pos then
-                suffix = suffix:sub(start_pos, #suffix)
-            end
 
-            if
-                config.ls["rust-analyzer"].preserve_type_when_truncate
-                and config.ls["rust-analyzer"].align_type_to_right
-            then
-                local params, type = string.match(suffix, "(%b()) %-> (.*)")
-                if params == nil and type == nil then
-                    params = suffix
-                    type = ""
-                end
-                local call, num_subs = string.gsub(label, regex_pattern, params, 1)
-                if num_subs == 0 then
-                    call = completion_item.label
-                end
-                local source = string.format(
-                    "%s %s->%s%s{}",
-                    prefix,
-                    call,
-                    align_spaces(call .. "  ", ignored ~= nil and type .. ignored or type),
-                    type or ""
-                )
-                local hl = utils.highlight_range(source, ls, #prefix + 1, #source - 2)
-                hl.text = hl.text:sub(1, #call) .. "  " .. hl.text:sub(#call + 3)
-                if ignored ~= nil then
-                    adjust(hl)
-                end
-                return hl
-            else
-                local call, num_subs = string.gsub(label, regex_pattern, suffix, 1)
-                if num_subs == 0 then
-                    call = label
-                end
-                local source = string.format("%s %s {}", prefix, call)
-                local hl = utils.highlight_range(source, ls, #prefix + 1, #source - 3)
-                if ignored ~= nil then
-                    adjust(hl)
-                end
-                return hl
-            end
-        else
-            -- Check if the detail starts with "macro_rules! "
-            if completion_item.detail and vim.startswith(completion_item.detail, "macro") then
-                local source = completion_item.label
-                return utils.highlight_range(source, ls, 0, #source)
-            else
-                -- simd_swizzle!()
-                return {
-                    text = completion_item.label,
-                    highlights = {
-                        {
-                            config.fallback_highlight,
-                            range = { 0, #completion_item.label },
-                        },
-                    },
+        -- Check for trait/import annotations in detail
+        if detail then
+            local trimmed = vim.trim(detail)
+            local is_annotation = trimmed:match("^%(as .+%)") or trimmed:match("^%(use .+%)") or trimmed:match("^%(alias .+%)")
+            if is_annotation then
+                -- Store detail separately for blink.cmp to render in separate column
+                hl.detail_text = trimmed
+                hl.detail_highlights = {
+                    {
+                        "@comment",
+                        range = { 0, #trimmed }
+                    }
                 }
             end
         end
+
+        return hl
         --
     else
         local highlight_name = nil
@@ -179,6 +151,12 @@ local function _rust_analyzer(completion_item, ls)
             highlight_name = utils.hl_exist_or("@lsp.type.enumMember", "@constant", "rust")
         elseif kind == Kind.Interface then
             highlight_name = utils.hl_exist_or("@lsp.type.interface", "@type", "rust")
+        elseif kind == Kind.Function or kind == Kind.Method then
+            highlight_name = "@function"
+        elseif kind == Kind.Field then
+            highlight_name = "@property"
+        elseif kind == Kind.Variable then
+            highlight_name = "@variable"
         elseif kind == Kind.Keyword then
             highlight_name = "@keyword"
         elseif kind == Kind.Value or kind == Kind.Constant then
@@ -189,19 +167,24 @@ local function _rust_analyzer(completion_item, ls)
 
         if detail then
             detail = vim.trim(detail)
-            if vim.startswith(detail, "(") then
-                local space = align_spaces(completion_item.label, detail)
+            -- Only keep import/trait annotations like (use ...), (as ...), (alias ...)
+            local is_import_annotation = detail:match("^%(use .+%)") or detail:match("^%(as .+%)") or detail:match("^%(alias .+%)")
+            if is_import_annotation then
                 return {
-                    text = completion_item.label .. space .. detail,
+                    text = completion_item.label,
                     highlights = {
                         {
                             highlight_name,
                             range = { 0, #completion_item.label },
                         },
+                    },
+                    -- Store detail separately for blink.cmp
+                    detail_text = detail,
+                    detail_highlights = {
                         {
-                            config.ls["rust-analyzer"].extra_info_hl,
-                            range = { #completion_item.label + #space, #completion_item.label + #space + #detail },
-                        },
+                            "@comment",
+                            range = { 0, #detail }
+                        }
                     },
                 }
             end
@@ -225,11 +208,12 @@ end
 function M.rust_analyzer(completion_item, ls)
     local vim_item = _rust_analyzer(completion_item, ls)
     if vim_item.text ~= nil then
+        -- Always highlight import/trait annotations with @comment
         for _, match in ipairs({ "%(use .-%)", "%(as .-%)", "%(alias .-%)" }) do
             local s, e = string.find(vim_item.text, match)
             if s ~= nil and e ~= nil then
                 table.insert(vim_item.highlights, {
-                    config.ls["rust-analyzer"].extra_info_hl,
+                    "@comment",
                     range = { s - 1, e },
                 })
             end
