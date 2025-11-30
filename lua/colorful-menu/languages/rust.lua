@@ -80,46 +80,72 @@ local function _rust_analyzer(completion_item, ls)
         -- Just highlight the label, optionally add ellipsis for args
         local current_label = label
 
+        -- Check if this is a macro (check completion_item.detail field)
+        local is_macro = completion_item.detail and completion_item.detail:match("^macro")
+
+        -- Add ! to label if it's a macro but label doesn't have it
+        if is_macro and not label:match("!") then
+            current_label = current_label .. "!"
+        end
+
         -- Ensure label has parentheses
         if not current_label:match("%(") then
             current_label = current_label .. "()"
         end
 
-        -- Create simple function syntax for treesitter highlighting
-        local source = string.format("fn %s {}", current_label)
-        local hl = utils.highlight_range(source, ls, 3, 3 + #current_label)
+        -- Create simple function/macro syntax for treesitter highlighting
+        local source
+        if is_macro then
+            -- For macros, use macro invocation syntax
+            source = string.format("%s;", current_label)
+        else
+            source = string.format("fn %s {}", current_label)
+        end
+        local offset = is_macro and 0 or 3
+        local hl = utils.highlight_range(source, ls, offset, offset + #current_label)
 
-        -- Check if function needs non-self arguments
-        local needs_args = false
-        if function_signature then
-            local params_match = function_signature:match("%((.-)%)")
-            if params_match then
-                -- Remove self variations and check if anything remains
-                local non_self = params_match:gsub("&?%s*mut%s+self%s*,?%s*", "")
-                                             :gsub("&?%s*self%s*,?%s*", "")
-                                             :gsub("^%s*", ""):gsub("%s*$", "")
-                if non_self ~= "" then
-                    needs_args = true
+        -- Override highlights for macros
+        if is_macro then
+            local macro_hl = utils.hl_exist_or("@function.macro", "@macro", "rust")
+            for _, h in ipairs(hl.highlights) do
+                -- Replace @function highlights with macro highlight
+                if h[1]:find("function") then
+                    h[1] = macro_hl
                 end
             end
-        end
-
-        -- Insert ellipsis if args are needed and parens are empty
-        if needs_args and current_label:match("%(%)") then
-            local open_paren_pos = hl.text:find("%(")
-            if open_paren_pos then
-                -- Insert … (3 bytes in UTF-8)
-                hl.text = hl.text:sub(1, open_paren_pos) .. "…" .. hl.text:sub(open_paren_pos + 1)
-                -- Shift highlights that come after insertion
-                for _, h in ipairs(hl.highlights) do
-                    if h.range[1] >= open_paren_pos then
-                        h.range = { h.range[1] + 3, h.range[2] + 3 }
-                    elseif h.range[2] > open_paren_pos then
-                        h.range = { h.range[1], h.range[2] + 3 }
+        else
+            -- Only add ellipsis for functions, not macros
+            local needs_args = false
+            if function_signature then
+                local params_match = function_signature:match("%((.-)%)")
+                if params_match then
+                    -- Remove self variations and check if anything remains
+                    local non_self = params_match:gsub("&?%s*mut%s+self%s*,?%s*", "")
+                                                 :gsub("&?%s*self%s*,?%s*", "")
+                                                 :gsub("^%s*", ""):gsub("%s*$", "")
+                    if non_self ~= "" then
+                        needs_args = true
                     end
                 end
-                -- Highlight the ellipsis
-                table.insert(hl.highlights, { "@comment", range = { open_paren_pos, open_paren_pos + 3 } })
+            end
+
+            -- Insert ellipsis if args are needed and parens are empty
+            if needs_args and current_label:match("%(%)") then
+                local open_paren_pos = hl.text:find("%(")
+                if open_paren_pos then
+                    -- Insert … (3 bytes in UTF-8)
+                    hl.text = hl.text:sub(1, open_paren_pos) .. "…" .. hl.text:sub(open_paren_pos + 1)
+                    -- Shift highlights that come after insertion
+                    for _, h in ipairs(hl.highlights) do
+                        if h.range[1] >= open_paren_pos then
+                            h.range = { h.range[1] + 3, h.range[2] + 3 }
+                        elseif h.range[2] > open_paren_pos then
+                            h.range = { h.range[1], h.range[2] + 3 }
+                        end
+                    end
+                    -- Highlight the ellipsis
+                    table.insert(hl.highlights, { "@comment", range = { open_paren_pos, open_paren_pos + 3 } })
+                end
             end
         end
 
@@ -142,6 +168,17 @@ local function _rust_analyzer(completion_item, ls)
         return hl
         --
     else
+        -- Check if this is a macro and update label accordingly
+        local display_label = label
+        local is_macro = false
+        if (kind == Kind.Function or kind == Kind.Method) and completion_item.detail then
+            is_macro = completion_item.detail:match("^macro")
+        end
+        -- Add ! to display label if it's a macro but label doesn't have it
+        if is_macro and not label:match("!") then
+            display_label = display_label .. "!"
+        end
+
         local highlight_name = nil
         if kind == Kind.Struct then
             highlight_name = "@type"
@@ -152,7 +189,11 @@ local function _rust_analyzer(completion_item, ls)
         elseif kind == Kind.Interface then
             highlight_name = utils.hl_exist_or("@lsp.type.interface", "@type", "rust")
         elseif kind == Kind.Function or kind == Kind.Method then
-            highlight_name = "@function"
+            if is_macro then
+                highlight_name = utils.hl_exist_or("@function.macro", "@macro", "rust")
+            else
+                highlight_name = "@function"
+            end
         elseif kind == Kind.Field then
             highlight_name = "@property"
         elseif kind == Kind.Variable then
@@ -171,11 +212,11 @@ local function _rust_analyzer(completion_item, ls)
             local is_import_annotation = detail:match("^%(use .+%)") or detail:match("^%(as .+%)") or detail:match("^%(alias .+%)")
             if is_import_annotation then
                 return {
-                    text = completion_item.label,
+                    text = display_label,
                     highlights = {
                         {
                             highlight_name,
-                            range = { 0, #completion_item.label },
+                            range = { 0, #display_label },
                         },
                     },
                     -- Store detail separately for blink.cmp
@@ -191,11 +232,11 @@ local function _rust_analyzer(completion_item, ls)
         end
 
         return {
-            text = completion_item.label,
+            text = display_label,
             highlights = {
                 {
                     highlight_name,
-                    range = { 0, #completion_item.label },
+                    range = { 0, #display_label },
                 },
             },
         }
