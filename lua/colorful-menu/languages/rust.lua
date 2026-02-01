@@ -80,40 +80,56 @@ local function _rust_analyzer(completion_item, ls)
         -- Just highlight the label, optionally add ellipsis for args
         local current_label = label
 
-        -- Check if this is a macro (check completion_item.detail field)
-        local is_macro = completion_item.detail and completion_item.detail:match("^macro")
+        local insert_text = (completion_item.textEdit and completion_item.textEdit.newText)
+            or completion_item.insertText
+            or label
+        local insert_has_bang = insert_text:match("!")
+        local insert_has_paren = insert_text:match("%(")
 
-        -- Add ! to label if it's a macro but label doesn't have it
-        if is_macro and not label:match("!") then
+        -- Add ! only if the insert text contains it
+        if insert_has_bang and not label:match("!") then
             current_label = current_label .. "!"
         end
 
-        -- Ensure label has parentheses
-        if not current_label:match("%(") then
+        -- Add () only if the insert text contains (
+        if insert_has_paren and not current_label:match("%(") then
             current_label = current_label .. "()"
         end
 
-        -- Create simple function/macro syntax for treesitter highlighting
+        -- Create syntax for treesitter highlighting based on insert text:
+        -- no ! and no ( → attribute context (e.g. #[default], #[cfg_accessible])
+        -- has ! → regular macro invocation (e.g. println!())
+        -- has ( but no ! → regular function (e.g. foo())
         local source
-        if is_macro then
-            -- For macros, use macro invocation syntax
+        local offset
+        if not insert_has_bang and not insert_has_paren then
+            if current_label:sub(1, 1):match("[A-Z]") then
+                -- PascalCase → derive macro (e.g. Debug, Default)
+                source = string.format("#[derive(%s)]", current_label)
+                offset = 9
+            else
+                -- snake_case → attribute (e.g. cfg_accessible, default)
+                source = string.format("#[%s]", current_label)
+                offset = 2
+            end
+        elseif insert_has_bang then
             source = string.format("%s;", current_label)
+            offset = 0
         else
             source = string.format("fn %s {}", current_label)
+            offset = 3
         end
-        local offset = is_macro and 0 or 3
         local hl = utils.highlight_range(source, ls, offset, offset + #current_label)
 
-        -- Override highlights for macros
-        if is_macro then
+        if insert_has_bang then
+            -- Override highlights for macros
             local macro_hl = utils.hl_exist_or("@function.macro", "@macro", "rust")
             for _, h in ipairs(hl.highlights) do
-                -- Replace @function highlights with macro highlight
                 if h[1]:find("function") then
                     h[1] = macro_hl
                 end
             end
-        else
+        elseif insert_has_paren then
             -- Only add ellipsis for functions, not macros
             local needs_args = false
             if function_signature then
@@ -168,15 +184,37 @@ local function _rust_analyzer(completion_item, ls)
         return hl
         --
     else
-        -- Check if this is a macro and update label accordingly
         local display_label = label
-        local is_macro = false
-        if (kind == Kind.Function or kind == Kind.Method) and completion_item.detail then
-            is_macro = completion_item.detail:match("^macro")
-        end
-        -- Add ! to display label if it's a macro but label doesn't have it
-        if is_macro and not label:match("!") then
+        local insert_text = (completion_item.textEdit and completion_item.textEdit.newText)
+            or completion_item.insertText
+            or label
+        local insert_has_bang = insert_text:match("!")
+
+        -- Add ! only if the insert text contains it
+        if insert_has_bang and not label:match("!") then
             display_label = display_label .. "!"
+        end
+
+        -- Function/Method completions without detail: built-in attributes or
+        -- multi-derive completions.
+        if (kind == Kind.Function or kind == Kind.Method) and not completion_item.detail then
+            local paren_pos = display_label:find("%(")
+            if paren_pos then
+                -- Built-in attribute completions like cfg(…), cfg_attr(…).
+                -- Use attribute syntax for correct treesitter highlighting.
+                local name = display_label:sub(1, paren_pos - 1)
+                local parens = display_label:sub(paren_pos)
+                local source = string.format("#[%s()]", name)
+                local hl = utils.highlight_range(source, ls, 2, 2 + #name)
+                hl.text = hl.text .. parens
+                table.insert(hl.highlights, { "@punctuation.bracket", range = { #name, #name + #parens } })
+                return hl
+            else
+                -- Multi-derive completions like "PartialEq, Eq".
+                -- Use derive syntax so treesitter highlights names as types/paths.
+                local source = string.format("#[derive(%s)]", display_label)
+                return utils.highlight_range(source, ls, 9, 9 + #display_label)
+            end
         end
 
         local highlight_name = nil
@@ -189,7 +227,7 @@ local function _rust_analyzer(completion_item, ls)
         elseif kind == Kind.Interface then
             highlight_name = utils.hl_exist_or("@lsp.type.interface", "@type", "rust")
         elseif kind == Kind.Function or kind == Kind.Method then
-            if is_macro then
+            if insert_has_bang then
                 highlight_name = utils.hl_exist_or("@function.macro", "@macro", "rust")
             else
                 highlight_name = "@function"
