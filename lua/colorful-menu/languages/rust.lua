@@ -76,10 +76,8 @@ local function _rust_analyzer(completion_item, ls)
         local source = string.format("enum S { %s }", name)
         return utils.highlight_range(source, ls, 9, 9 + #name)
         --
-    elseif (kind == Kind.Function or kind == Kind.Method) and detail then
-        -- Just highlight the label, optionally add ellipsis for args
+    elseif kind == Kind.Function or kind == Kind.Method then
         local current_label = label
-
         local insert_text = (completion_item.textEdit and completion_item.textEdit.newText)
             or completion_item.insertText
             or label
@@ -96,46 +94,55 @@ local function _rust_analyzer(completion_item, ls)
             current_label = current_label .. "()"
         end
 
-        -- Create syntax for treesitter highlighting based on insert text:
-        -- no ! and no ( → attribute context (e.g. #[default], #[cfg_accessible])
-        -- has ! → regular macro invocation (e.g. println!())
-        -- has ( but no ! → regular function (e.g. foo())
-        local source
-        local offset
-        if not insert_has_bang and not insert_has_paren then
+        -- Choose treesitter source based on insert text content:
+        -- no detail + label has ( → built-in attribute with args (cfg(…), deny(…))
+        -- no ! and no ( → attribute context (cfg_accessible, default, Debug)
+        -- has ! → regular macro invocation (println!())
+        -- has ( but no ! → regular function (foo())
+        local hl
+        if not detail and current_label:find("%(") then
+            -- Built-in attributes: cfg(…), cfg_attr(…), deny(…), etc.
+            -- Label already contains parens from LSP.
+            local paren_pos = current_label:find("%(")
+            local name = current_label:sub(1, paren_pos - 1)
+            local parens = current_label:sub(paren_pos)
+            local source = string.format("#[%s()]", name)
+            hl = utils.highlight_range(source, ls, 2, 2 + #name)
+            hl.text = hl.text .. parens
+            table.insert(hl.highlights, { "@punctuation.bracket", range = { #name, #name + #parens } })
+        elseif not insert_has_bang and not insert_has_paren then
+            -- Attribute context (derive macros, derive helpers, attribute macros)
+            local source, offset
             if current_label:sub(1, 1):match("[A-Z]") then
-                -- PascalCase → derive macro (e.g. Debug, Default)
+                -- PascalCase → derive macro or multi-derive (Debug, PartialEq, Eq)
                 source = string.format("#[derive(%s)]", current_label)
                 offset = 9
             else
-                -- snake_case → attribute (e.g. cfg_accessible, default)
+                -- snake_case → attribute (cfg_accessible, default, non_exhaustive)
                 source = string.format("#[%s]", current_label)
                 offset = 2
             end
+            hl = utils.highlight_range(source, ls, offset, offset + #current_label)
         elseif insert_has_bang then
-            source = string.format("%s;", current_label)
-            offset = 0
-        else
-            source = string.format("fn %s {}", current_label)
-            offset = 3
-        end
-        local hl = utils.highlight_range(source, ls, offset, offset + #current_label)
-
-        if insert_has_bang then
-            -- Override highlights for macros
+            -- Regular macro invocation (println, vec, etc.)
+            local source = string.format("%s;", current_label)
+            hl = utils.highlight_range(source, ls, 0, #current_label)
             local macro_hl = utils.hl_exist_or("@function.macro", "@macro", "rust")
             for _, h in ipairs(hl.highlights) do
                 if h[1]:find("function") then
                     h[1] = macro_hl
                 end
             end
-        elseif insert_has_paren then
-            -- Only add ellipsis for functions, not macros
+        else
+            -- Regular function
+            local source = string.format("fn %s {}", current_label)
+            hl = utils.highlight_range(source, ls, 3, 3 + #current_label)
+
+            -- Add ellipsis if function has non-self args
             local needs_args = false
             if function_signature then
                 local params_match = function_signature:match("%((.-)%)")
                 if params_match then
-                    -- Remove self variations and check if anything remains
                     local non_self = params_match:gsub("&?%s*mut%s+self%s*,?%s*", "")
                                                  :gsub("&?%s*self%s*,?%s*", "")
                                                  :gsub("^%s*", ""):gsub("%s*$", "")
@@ -145,13 +152,10 @@ local function _rust_analyzer(completion_item, ls)
                 end
             end
 
-            -- Insert ellipsis if args are needed and parens are empty
             if needs_args and current_label:match("%(%)") then
                 local open_paren_pos = hl.text:find("%(")
                 if open_paren_pos then
-                    -- Insert … (3 bytes in UTF-8)
                     hl.text = hl.text:sub(1, open_paren_pos) .. "…" .. hl.text:sub(open_paren_pos + 1)
-                    -- Shift highlights that come after insertion
                     for _, h in ipairs(hl.highlights) do
                         if h.range[1] >= open_paren_pos then
                             h.range = { h.range[1] + 3, h.range[2] + 3 }
@@ -159,24 +163,19 @@ local function _rust_analyzer(completion_item, ls)
                             h.range = { h.range[1], h.range[2] + 3 }
                         end
                     end
-                    -- Highlight the ellipsis
                     table.insert(hl.highlights, { "@comment", range = { open_paren_pos, open_paren_pos + 3 } })
                 end
             end
         end
 
-        -- Check for trait/import annotations in detail
+        -- Detail annotations: (use ...), (as ...), (alias ...)
         if detail then
             local trimmed = vim.trim(detail)
             local is_annotation = trimmed:match("^%(as .+%)") or trimmed:match("^%(use .+%)") or trimmed:match("^%(alias .+%)")
             if is_annotation then
-                -- Store detail separately for blink.cmp to render in separate column
                 hl.detail_text = trimmed
                 hl.detail_highlights = {
-                    {
-                        "@comment",
-                        range = { 0, #trimmed }
-                    }
+                    { "@comment", range = { 0, #trimmed } }
                 }
             end
         end
@@ -185,37 +184,6 @@ local function _rust_analyzer(completion_item, ls)
         --
     else
         local display_label = label
-        local insert_text = (completion_item.textEdit and completion_item.textEdit.newText)
-            or completion_item.insertText
-            or label
-        local insert_has_bang = insert_text:match("!")
-
-        -- Add ! only if the insert text contains it
-        if insert_has_bang and not label:match("!") then
-            display_label = display_label .. "!"
-        end
-
-        -- Function/Method completions without detail: built-in attributes or
-        -- multi-derive completions.
-        if (kind == Kind.Function or kind == Kind.Method) and not completion_item.detail then
-            local paren_pos = display_label:find("%(")
-            if paren_pos then
-                -- Built-in attribute completions like cfg(…), cfg_attr(…).
-                -- Use attribute syntax for correct treesitter highlighting.
-                local name = display_label:sub(1, paren_pos - 1)
-                local parens = display_label:sub(paren_pos)
-                local source = string.format("#[%s()]", name)
-                local hl = utils.highlight_range(source, ls, 2, 2 + #name)
-                hl.text = hl.text .. parens
-                table.insert(hl.highlights, { "@punctuation.bracket", range = { #name, #name + #parens } })
-                return hl
-            else
-                -- Multi-derive completions like "PartialEq, Eq".
-                -- Use derive syntax so treesitter highlights names as types/paths.
-                local source = string.format("#[derive(%s)]", display_label)
-                return utils.highlight_range(source, ls, 9, 9 + #display_label)
-            end
-        end
 
         local highlight_name = nil
         if kind == Kind.Struct then
@@ -226,12 +194,6 @@ local function _rust_analyzer(completion_item, ls)
             highlight_name = utils.hl_exist_or("@lsp.type.enumMember", "@constant", "rust")
         elseif kind == Kind.Interface then
             highlight_name = utils.hl_exist_or("@lsp.type.interface", "@type", "rust")
-        elseif kind == Kind.Function or kind == Kind.Method then
-            if insert_has_bang then
-                highlight_name = utils.hl_exist_or("@function.macro", "@macro", "rust")
-            else
-                highlight_name = "@function"
-            end
         elseif kind == Kind.Field then
             highlight_name = "@property"
         elseif kind == Kind.Variable then
@@ -245,25 +207,17 @@ local function _rust_analyzer(completion_item, ls)
         end
 
         if detail then
-            detail = vim.trim(detail)
-            -- Only keep import/trait annotations like (use ...), (as ...), (alias ...)
-            local is_import_annotation = detail:match("^%(use .+%)") or detail:match("^%(as .+%)") or detail:match("^%(alias .+%)")
-            if is_import_annotation then
+            local trimmed = vim.trim(detail)
+            local is_annotation = trimmed:match("^%(use .+%)") or trimmed:match("^%(as .+%)") or trimmed:match("^%(alias .+%)")
+            if is_annotation then
                 return {
                     text = display_label,
                     highlights = {
-                        {
-                            highlight_name,
-                            range = { 0, #display_label },
-                        },
+                        { highlight_name, range = { 0, #display_label } },
                     },
-                    -- Store detail separately for blink.cmp
-                    detail_text = detail,
+                    detail_text = trimmed,
                     detail_highlights = {
-                        {
-                            "@comment",
-                            range = { 0, #detail }
-                        }
+                        { "@comment", range = { 0, #trimmed } }
                     },
                 }
             end
@@ -272,10 +226,7 @@ local function _rust_analyzer(completion_item, ls)
         return {
             text = display_label,
             highlights = {
-                {
-                    highlight_name,
-                    range = { 0, #display_label },
-                },
+                { highlight_name, range = { 0, #display_label } },
             },
         }
     end
