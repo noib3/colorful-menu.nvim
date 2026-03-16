@@ -84,6 +84,15 @@ local function _rust_analyzer(completion_item, ls)
         local insert_has_bang = insert_text:match("!")
         local insert_has_paren = insert_text:match("%(")
 
+        -- rust-analyzer omits parentheses from textEdit.newText when they
+        -- already exist after the cursor in the buffer. Detect this by checking
+        -- whether the detail looks like a function signature. When it does,
+        -- treat the item as a regular function call so it gets the correct
+        -- highlight and the "()" / "(…)" suffix.
+        if not insert_has_paren then
+            insert_has_paren = detail and detail:match("fn%(") ~= nil
+        end
+
         -- Add ! only if the insert text contains it
         if insert_has_bang and not label:match("!") then
             current_label = current_label .. "!"
@@ -143,9 +152,11 @@ local function _rust_analyzer(completion_item, ls)
             if function_signature then
                 local params_match = function_signature:match("%((.-)%)")
                 if params_match then
-                    local non_self = params_match:gsub("&?%s*mut%s+self%s*,?%s*", "")
-                                                 :gsub("&?%s*self%s*,?%s*", "")
-                                                 :gsub("^%s*", ""):gsub("%s*$", "")
+                    local non_self = params_match
+                        :gsub("&?%s*mut%s+self%s*,?%s*", "")
+                        :gsub("&?%s*self%s*,?%s*", "")
+                        :gsub("^%s*", "")
+                        :gsub("%s*$", "")
                     if non_self ~= "" then
                         needs_args = true
                     end
@@ -171,11 +182,13 @@ local function _rust_analyzer(completion_item, ls)
         -- Detail annotations: (use ...), (as ...), (alias ...)
         if detail then
             local trimmed = vim.trim(detail)
-            local is_annotation = trimmed:match("^%(as .+%)") or trimmed:match("^%(use .+%)") or trimmed:match("^%(alias .+%)")
+            local is_annotation = trimmed:match("^%(as .+%)")
+                or trimmed:match("^%(use .+%)")
+                or trimmed:match("^%(alias .+%)")
             if is_annotation then
                 hl.detail_text = trimmed
                 hl.detail_highlights = {
-                    { "@comment", range = { 0, #trimmed } }
+                    { "@comment", range = { 0, #trimmed } },
                 }
             end
         end
@@ -208,7 +221,9 @@ local function _rust_analyzer(completion_item, ls)
 
         if detail then
             local trimmed = vim.trim(detail)
-            local is_annotation = trimmed:match("^%(use .+%)") or trimmed:match("^%(as .+%)") or trimmed:match("^%(alias .+%)")
+            local is_annotation = trimmed:match("^%(use .+%)")
+                or trimmed:match("^%(as .+%)")
+                or trimmed:match("^%(alias .+%)")
             if is_annotation then
                 return {
                     text = display_label,
@@ -217,7 +232,7 @@ local function _rust_analyzer(completion_item, ls)
                     },
                     detail_text = trimmed,
                     detail_highlights = {
-                        { "@comment", range = { 0, #trimmed } }
+                        { "@comment", range = { 0, #trimmed } },
                     },
                 }
             end
